@@ -1,0 +1,14 @@
+# local model weights / caches — never commit (157GB)
+models/
+*.safetensors
+*.gguf
+
+# logs / scratch
+*.log
+scratch/
+tmp/
+
+# editor
+.vscode/
+.idea/
+*.swp
