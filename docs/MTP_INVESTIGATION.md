@@ -171,3 +171,79 @@ and MTP fixed. That test is pending.
   there won't fire on replay. Use `--enforce-eager` to see it run.
 - After editing an installed `.py`, delete its `__pycache__/*.pyc` (a stale
   `.pyc` will silently win) or run with `PYTHONDONTWRITEBYTECODE=1`.
+
+---
+
+## Act 5 — B12X native backend test (2026-06-24): **boots, draft still 0% accepted**
+
+A different vLLM build with a native SM120 W4A16/W4A8 MoE backend
+(`voipmonitor/vllm:chthonic-...-b12x0ff2847-pr20-cu132`, `--moe-backend b12x`)
+was supposed to be the fix. The upstream `local-inference-lab/rtx6kpro` doc
+reports acceptance ~0.68 on this backend, and it was the strongest candidate to
+confirm "MARLIN fallback is the root cause."
+
+**What happened (proven):**
+
+- The B12X image pulled and the server **boots to ready** on this exact hardware
+  (2× RTX PRO 6000, TP2). Weights load (79.96 GiB/GPU), MTP draft loads (39
+  params), all CUDA graphs (PIECEWISE + FULL) capture, `/health` returns 200.
+- **But the nvidia/NVFP4 checkpoint is rejected by the B12X oracle gate** at
+  init with:
+  > `ValueError: Model sets swiglu_limit=10.0, but the explicitly requested
+  > moe_backend='b12x' does not apply the SwiGLU clamp. Use
+  > 'flashinfer_trtllm' or 'flashinfer_cutlass' instead.`
+- Root cause of that gate: `nvfp4.py::_backend_supports_clamp` only allows B12X
+  to clamp when `activation == SWIGLUOAI_UNINTERLEAVE`. Our checkpoint is
+  `hidden_act=silu` (→ `MoEActivation.SILU`) with `swiglu_limit=10.0`, so it is
+  **over-blocked**. The B12X kernel itself (`b12x_moe.py`) *does* support SILU
+  (`_supports_activation` lists it) and *does* apply `swiglu_limit` for
+  `quant_mode == w4a8_nvfp4` (this model) regardless of activation. So the gate
+  is more conservative than the kernel.
+- **A 1-line mount-overlay patch** (`patches/nvfp4.py`) widens the gate to allow
+  `SILU`/`SWIGLUOAI` too. With the patch, init passes and the server starts.
+
+**The decisive measurement (proven):**
+
+With B12X + the clamp patch + MTP enabled, the repeat-prompt and counting tests
+still report:
+
+> `SpecDecoding metrics: ... Accepted: 0 tokens, Drafted: N,
+> Per-position acceptance rate: 0.000, 0.000, Avg Draft acceptance rate: 0.0%`
+
+The main model generates correctly (repeat prompt loops the right sentence;
+counting is correct), so the **target** model is fine. The **draft** is still
+proposing tokens that the target rejects 100%. This is the same 0% signature as
+the MARLIN build.
+
+**What this means:**
+
+- B12X native backend, by itself, does **not** fix the draft on the
+  `nvidia/DeepSeek-V4-Flash-NVFP4` checkpoint. The upstream 0.68 result was on a
+  different weight repo (`deepseek-ai/DeepSeek-V4-Flash`), not this NVFP4 one.
+- The leading "MARLIN fallback is the root cause" hypothesis is **weakened, not
+  confirmed**. A genuinely different backend (B12X) still produces a 0%-accepted
+  draft. The shared factor across both MARLIN and B12X is the **checkpoint's MTP
+  weights**, not the MoE backend.
+- This redirects the root cause toward the **MTP draft weights themselves**
+  (consistent with the earlier `int8` vs `uint8` anomaly in the MTP block) or a
+  draft-model **load/forward path** that is independent of `moe_backend`. Recall
+  (Act 4 / config): the MTP block is in `quantization_config.ignore` → it is
+  **BF16, not NVFP4**. So the draft's MoE experts are unquantized; an
+  `int8`/`uint8` reinterpretation would only matter if something still unpacks
+  those BF16 bytes as packed FP4. That mismatch is the new prime suspect.
+
+**Status:** MTP draft **still broken (0% accepted)** on B12X. Root cause is
+**not** the MoE backend. Next decisive test is either (a) the upstream
+`deepseek-ai/DeepSeek-V4-Flash` weights on B12X, or (b) the MARLIN-side
+`int8→uint8` reinterpreted-view patch in the MTP load path.
+
+### Reproduction
+
+- Image: `voipmonitor/vllm:chthonic-consecration-f1190eab-b12x0ff2847-pr20-cu132`
+- Script: `~/scratch_vllm/serve_b12x_tp2.sh` (+ `b12x_inner.sh` + `patches/nvfp4.py`)
+- Key flags: `--moe-backend b12x --linear-backend b12x --attention-backend
+  B12X_MLA_SPARSE`, speculative config `method=mtp,num_speculative_tokens=2`,
+  `--max-model-len 3072` (KV budget ~1.55 GiB → 3840 tokens), `--gpu-memory-utilization 0.875`
+- Caveat: `--max-model-len` had to drop to 3072 because B12X weights consume
+  ~80 GiB/GPU, leaving only ~1.55 GiB for KV. This does not affect the
+  acceptance measurement (the repeat/counting prompts are tiny).
