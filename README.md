@@ -5,6 +5,15 @@ A minimal, working kit to serve **DeepSeek-V4-Flash (NVFP4)** on
 Multi-Token Prediction (MTP) speculative decoding**, which gives a measured
 **+38% single-stream decode** on this hardware.
 
+It also documents a second, independent result: **a single `1,048,576`-token
+(1M) context window** — up from a default `3,072` — and a `1.9M`-token KV pool
+(shared across concurrent requests, not a single window), reached with **two
+serve flags, no change to weights, quality, or decode speed** (long-prompt
+prefill is slower). The default `--max-model-len 3072` was capping single-request
+context **~341×** below the model's YaRN ceiling. See
+[`docs/CONTEXT_LENGTH.md`](docs/CONTEXT_LENGTH.md). *(This part is not
+SM120-specific — it applies to any DeepSeek-V4-Flash on vLLM.)*
+
 The model and its custom vLLM build target datacenter Blackwell (SM100 / B200).
 Getting it to run on consumer Blackwell (SM120) means stepping on a series of
 landmines. This repo clears them — and documents the hardest one in full: MTP
@@ -25,6 +34,7 @@ complete debugging log (Acts 1–7).
 | `serve_b12x_tp2.sh SPEC=0` — B12X native, MTP off | ✅ works — baseline 108.8 t/s single-stream |
 | `serve.sh` — MARLIN path, no MTP | ✅ works (decode ~64 t/s single, KV pool 307k tokens) |
 | `serve-mtp.sh` — MARLIN path + MTP | ⚠️ draft broken on this path (~0% acceptance); the fix was landed on the **B12X** path, not MARLIN — use `serve_b12x_tp2.sh` |
+| **Long context** — `MNBT=512 MAXLEN=1048576` | ✅ **single 1M-token context** (capacity-verified; load-tested only on short prompts), KV pool **1,925,540 tokens** shared (vs default 17,300 / single-cap 3,072); config-only, quality + decode speed untouched — see [`docs/CONTEXT_LENGTH.md`](docs/CONTEXT_LENGTH.md) |
 
 ## MTP on SM120 — solved (the headline)
 
@@ -80,6 +90,31 @@ TTFT + tok/s on the last line:
 Each script detects the server's current mode and only restarts when it must, so
 the off-baseline is genuinely MTP-off and not a silent apples-to-oranges.
 
+## Long context — 3K → 1M tokens (config only)
+
+The stock config serves a **17,300-token** KV pool (shared across ~5.6 concurrent
+streams) with a **3,072-token single-request cap**. That is not a VRAM, fp8, or
+model limit — it is a default `--max-num-batched-tokens=4096` that makes
+DeepSeek-V4's fp32 `CompressorStateCache` (true window 8 / 128 tokens) reserve
+**~256× more** than it needs, eating ~89–91% of per-request KV. Two flags fix it:
+
+```bash
+# single 1,048,576-token context, KV pool ~1.93M tokens (shared) — same KV budget
+UTIL=0.93 MAXLEN=1048576 MNBT=512 SPEC=1 ./serve_b12x_tp2.sh
+docker logs dsv4b12x 2>&1 | grep "GPU KV cache size"   # -> 1,925,540 tokens
+```
+
+| `max_model_len` | `mnbt` | KV pool | concurrency | single ctx |
+|---|---|---:|---:|---:|
+| 3,072 *(default)* | 4096 | 17,300 | 5.63× | 3,072 |
+| 131,072 | 512 | 1,403,251 | 10.7× | 131,072 |
+| **1,048,576** | 512 | **1,925,540** | 1.84× | **1,048,576** |
+
+Decode/MTP throughput is unchanged (it is `num_seqs`-bound, not `mnbt`-bound);
+only prompt prefill chunks smaller. Full root-cause, wall formula, the
+"why not NVFP4 KV" dead end, and the headroom tradeoffs:
+[`docs/CONTEXT_LENGTH.md`](docs/CONTEXT_LENGTH.md).
+
 ## Prerequisites
 
 - 2× RTX PRO 6000 (SM120, compute 12.0), 96 GB VRAM each
@@ -127,13 +162,15 @@ MODEL_DIR=./models/DeepSeek-V4-Flash-NVFP4 ./serve.sh
 
 ## Known limitations
 
-- **`--max-model-len 3072` on the B12X/MTP path.** B12X weights take ~80 GiB/GPU,
-  leaving ~1.75 GiB for KV (~4335 tokens). This is a memory-budget limit, not an
-  MTP correctness limit; acceptance and decode speed are unaffected. Long-context
-  serving on the B12X path needs a separate KV-budget plan.
+- **~~`--max-model-len 3072` is a memory limit~~ — superseded.** This was *not* a
+  VRAM limit: it was a default `--max-num-batched-tokens` over-allocating the fp32
+  state cache. Lowering `MNBT` and raising `MAXLEN` gives single 1M context at the
+  same KV budget — see [`docs/CONTEXT_LENGTH.md`](docs/CONTEXT_LENGTH.md).
 - **MARLIN is weight-only FP4 dequant** — slower decode than the B12X native path
   (compare ~64 t/s MARLIN vs 108.8 t/s B12X off, single-stream).
-- **NVFP4 KV cache unsupported** on the DSv4 sparse-MLA path (fp8 KV only).
+- **NVFP4 KV cache unsupported** on the DSv4 sparse-MLA path (fp8 KV only) — and
+  not worth porting: it would touch only the ~9% fp8-KV slice (~×1.03 pool), not
+  the fp32 state cache that actually gated context. See `docs/CONTEXT_LENGTH.md`.
 - **MTP is fixed on the B12X path only**, not MARLIN (`serve-mtp.sh`).
 
 ## Benchmarks
