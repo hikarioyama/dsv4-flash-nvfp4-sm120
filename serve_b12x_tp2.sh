@@ -34,7 +34,7 @@ docker run -d --name "$NAME" --gpus all --runtime nvidia --ipc host --shm-size 3
   -e VLLM_USE_B12X_FP8_GEMM=1 -e VLLM_USE_B12X_MOE=1 -e VLLM_USE_B12X_SPARSE_INDEXER=1 \
   -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_PCIE_ALLREDUCE_BACKEND=b12x -e VLLM_ENABLE_PCIE_ALLREDUCE=1 \
   -e B12X_MLA_SM120_UNIFIED=1 -e USES_B12X=True -e B12X_DENSE_SPLITK_TURBO=1 -e B12X_W4A16_TC_DECODE=1 \
-  -e SPEC="$SPEC" -e PORT="$PORT" \
+  -e SPEC="$SPEC" -e PORT="$PORT" -e UTIL="${UTIL:-0.875}" -e MAXLEN="${MAXLEN:-3072}" -e MNBT="${MNBT:-4096}" \
   --entrypoint /bin/bash "$IMG" /inner.sh
 
-echo "==> launched $NAME (TP2, B12X, MTP=$SPEC, patched nvfp4+quant_config) on :$PORT"
+echo "==> launched $NAME (TP2, B12X, MTP=$SPEC, util=${UTIL:-0.875}, maxlen=${MAXLEN:-3072}, mnbt=${MNBT:-4096}) on :$PORT"

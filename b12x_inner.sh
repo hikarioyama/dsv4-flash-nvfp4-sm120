@@ -9,9 +9,9 @@ exec /opt/venv/bin/python -m vllm.entrypoints.cli.main serve /model \
   --served-model-name DeepSeek-V4-Flash --host 0.0.0.0 --port "${PORT:-8000}" \
   --kv-cache-dtype fp8 --block-size 256 --load-format safetensors \
   --tensor-parallel-size 2 --moe-backend b12x --linear-backend b12x \
-  --gpu-memory-utilization 0.875 --max-model-len 3072 --max-num-seqs 64 \
+  --gpu-memory-utilization "${UTIL:-0.875}" --max-model-len "${MAXLEN:-3072}" --max-num-seqs 64 \
   --async-scheduling --no-scheduler-reserve-full-isl \
-  --max-num-batched-tokens 4096 --max-cudagraph-capture-size 192 \
+  --max-num-batched-tokens "${MNBT:-4096}" --max-cudagraph-capture-size 192 \
   --attention-backend B12X_MLA_SPARSE --enable-chunked-prefill --enable-prefix-caching \
   --compilation-config='{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4 \
