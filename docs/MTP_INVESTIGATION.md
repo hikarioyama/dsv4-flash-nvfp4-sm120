@@ -247,3 +247,94 @@ the MARLIN build.
 - Caveat: `--max-model-len` had to drop to 3072 because B12X weights consume
   ~80 GiB/GPU, leaving only ~1.55 GiB for KV. This does not affect the
   acceptance measurement (the repeat/counting prompts are tiny).
+
+---
+
+## Act 6 — ROOT CAUSE FOUND + FIXED (2026-06-24): MTP draft experts are MXFP4, loader forced NVFP4
+
+**Root cause (proven by checkpoint inspection + dtype copy_ tests + code trace):**
+
+The `nvidia/DeepSeek-V4-Flash-NVFP4` checkpoint stores the **main model** experts as
+**NVFP4** (block scales `float8_e4m3fn`, group_size=16, with `weight_scale_2` +
+`input_scale` per-expert global scales), but stores the **MTP draft** experts as
+**MXFP4** (block scales `float8_e8m0fnu`, group_size=32, NO `weight_scale_2` /
+`input_scale`). Evidence from `model-00046-of-00046.safetensors`:
+
+| key | dtype | shape | format |
+|---|---|---|---|
+| `layers.0.ffn.experts.0.w1.weight` | `uint8` | (2048,2048) | NVFP4 packed |
+| `layers.0.ffn.experts.0.w1.weight_scale` | `float8_e4m3fn` | (2048,256) | group_size=16 |
+| `layers.0.ffn.experts.0.w1.weight_scale_2` | `float32` | () | per-tensor global sf |
+| `layers.0.ffn.experts.0.w1.input_scale` | `float32` | () | per-tensor input sf |
+| `mtp.0.ffn.experts.0.w1.weight` | `int8` | (2048,2048) | MXFP4 packed |
+| `mtp.0.ffn.experts.0.w1.scale` | `float8_e8m0fnu` | (2048,128) | group_size=32 |
+| (no `weight_scale_2` / `input_scale` for mtp) | — | — | MXFP4 has none |
+
+The `config.json` `quantization_config.ignore` list includes `"mtp.*"`, signaling
+"MTP is not quantized the same way." But the **expert prefix** at init time is
+`model.layers.{num_hidden_layers+i}.ffn.experts` (the `mtp.` checkpoint name is
+only used at weight-load time, not at `get_quant_method` time). `is_layer_skipped`
+checks `prefix in ignored_layer` for experts; `model.layers.43.ffn.experts` does
+not match `"mtp.*"`, so the draft experts are **not** skipped.
+
+Result: `DeepseekV4FP8Config.get_quant_method` routes the draft experts to
+`ModelOptNvFp4FusedMoE` (NVFP4), which:
+- declares `w13_weight_scale` as `float8_e4m3fn` (group_size=16),
+- requires `weight_scale_2` + `input_scale` (per-tensor global scales).
+
+The MTP loader (`mtp.py`) reinterprets the e8m0 scale via `view(torch.uint8)`
+(to preserve raw exponent bytes), then the weight_loader does
+`param.data.copy_(loaded_weight)` into the **e4m3** param. `copy_` from
+`uint8`→`float8_e4m3fn` performs a **numeric conversion** (proven: byte `0x80`
+e8m0=2.0 → e4m3 byte `0x70`=2.0, NOT bit-preserving), destroying the scale
+exponent bytes. Additionally, `weight_scale_2`/`input_scale` are absent from the
+checkpoint, leaving those params as **uninitialized `torch.empty` garbage**.
+
+Both corruptions make the draft MoE dequant produce garbage → 0% acceptance.
+
+**The fix (proven by measurement):**
+
+Patch `quant_config.py::get_quant_method` to route experts whose layer index
+`>= num_hidden_layers` (i.e. MTP draft layers) to `Mxfp4MoEMethod` instead of
+`ModelOptNvFp4FusedMoE`. `Mxfp4MoEMethod`:
+- declares `w13_weight_scale` as `uint8` (e8m0 bytes preserved by `view(uint8)`
+  → `copy_` uint8→uint8 = identity),
+- uses `mxfp4_block=32` matching the checkpoint group_size,
+- has **no** `weight_scale_2`/`input_scale` requirement,
+- supports `B12X` backend with `swiglu_limit` (gemm1_clamp_limit).
+
+Shape check confirms exact compatibility:
+- Mxfp4 `w13_weight_scale = (E, 2*inter, hidden//32) = (E, 4096, 128)` == MTP
+  fused w1+w3 scale `(4096, 128)`. ✓
+- Mxfp4 `w2_weight_scale = (E, hidden, inter//32) = (E, 4096, 64)` == MTP
+  w2 scale `(4096, 64)`. ✓
+
+**Measurement (proven, 2026-06-24 16:28):**
+
+With the Mxfp4 routing patch + the nvfp4 clamp-gate patch, B12X TP2, MTP enabled:
+
+- Repeat-prompt (20× "The quick brown fox..."): **Avg Draft acceptance rate
+  69.4%**, Per-position 0.907 / 0.481, Mean acceptance length 2.39.
+- Diverse prompts (counting, capitals): **74.8%** then **89.3%**, Per-position
+  up to 0.929 / 0.857, Mean acceptance length up to 2.79.
+
+This matches the upstream `local-inference-lab/rtx6kpro` report of ~0.68
+acceptance for this backend. **MTP is now working.**
+
+**Patches (mount-overlay, non-invasive):**
+- `patches/nvfp4.py` — widen `_backend_supports_clamp` to allow B12X + SILU clamp.
+- `patches/quant_config.py` — route MTP draft experts (layer >= num_hidden_layers)
+  to `Mxfp4MoEMethod` (matches the MXFP4 checkpoint format).
+
+**Caveats:**
+- `--max-model-len 3072` is still required (B12X weights ~80 GiB/GPU → only
+  ~1.75 GiB KV → 4335 tokens). This is a memory budget limit, not an MTP
+  correctness limit; acceptance is measured on tiny prompts.
+- The `int8` vs `uint8` weight-dtype anomaly from Act 4 is now explained: MTP
+  experts are MXFP4 (stored `int8`), main experts are NVFP4 (stored `uint8`).
+  The `int8` is NOT a bug — it is the MXFP4 checkpoint convention. The bug was
+  forcing NVFP4 (e4m3-scale, group_size=16, global-sf) interpretation onto
+  MXFP4 (e8m0-scale, group_size=32, no-global-sf) data.
+
+**Status: MTP RESOLVED.** Draft acceptance ~69-89% on this hardware
+(2× RTX PRO 6000, TP2, B12X MXFP4 draft backend).
