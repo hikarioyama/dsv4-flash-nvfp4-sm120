@@ -1,0 +1,8 @@
+{"label": "MTP_OFF", "event": "warmup_done"}
+{"label": "MTP_OFF", "mode": "single", "run": 0, "completion_tokens": 256, "wall_s": 2.36, "tok_s": 108.5}
+{"label": "MTP_OFF", "mode": "single", "run": 1, "completion_tokens": 256, "wall_s": 2.348, "tok_s": 109.0}
+{"label": "MTP_OFF", "mode": "single", "run": 2, "completion_tokens": 256, "wall_s": 2.362, "tok_s": 108.4}
+{"label": "MTP_OFF", "mode": "single", "run": 3, "completion_tokens": 256, "wall_s": 2.345, "tok_s": 109.2}
+{"label": "MTP_OFF", "mode": "concurrent", "round": 0, "n_concurrent": 4, "total_tokens": 1024, "wall_s": 9.525, "aggregate_tok_s": 107.5}
+{"label": "MTP_OFF", "mode": "concurrent", "round": 1, "n_concurrent": 4, "total_tokens": 1024, "wall_s": 4.058, "aggregate_tok_s": 252.3}
+{"label": "MTP_OFF", "event": "done"}
