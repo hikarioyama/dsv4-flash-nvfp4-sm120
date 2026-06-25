@@ -134,10 +134,15 @@ of each script). Defaults assume a local layout; override to match yours.
 MTP path (recommended — the fast one):
 
 ```bash
-MODEL_DIR=./models/DeepSeek-V4-Flash-NVFP4 SPEC=1 ./serve_b12x_tp2.sh  # MTP on
-# ~10 min: weight load (157 GB) + torch.compile + warmup + speculator capture
+# Defaults: MTP on + single 1M context (MNBT=512 MAXLEN=1048576 UTIL=0.93)
+MODEL_DIR=./models/DeepSeek-V4-Flash-NVFP4 SPEC=1 ./serve_b12x_tp2.sh
+# ~19 min: weight load (157 GB) + torch.compile + warmup + 1M cudagraph capture
+#   -> GPU KV cache size: 1,925,540 tokens ; single ctx up to 1,048,576
 ./run_mtp_on.sh    # stream a 1000-token completion, print TTFT + tok/s
 ./stop.sh
+
+# More VRAM headroom / faster warmup? Use a balanced 256K context instead:
+#   UTIL=0.94 MAXLEN=262144 MNBT=512 SPEC=1 ./serve_b12x_tp2.sh
 ```
 
 MARLIN path (no MTP, simpler image):
